@@ -31,6 +31,13 @@ io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}. Online: ${onlineUsers}`);
 
     socket.on('find_partner', (peerId) => {
+        // Validate peerId before queuing
+        if (!peerId) {
+            console.warn(`Socket ${socket.id} sent empty peerId, ignoring`);
+            socket.emit('peer_not_ready');
+            return;
+        }
+
         // Store the peerId with the socket
         socket.peerId = peerId;
 
@@ -39,13 +46,21 @@ io.on('connection', (socket) => {
 
             // Check if partner is still connected
             if (partner.connected) {
-                // Emit match found to both
-                socket.emit('match_found', { partnerId: partner.peerId, initiator: true });
-                partner.emit('match_found', { partnerId: socket.peerId, initiator: false });
-
                 // Store partner info
                 socket.partner = partner;
                 partner.partner = socket;
+
+                // Mark initiator flags
+                socket.isInitiator = true;
+                partner.isInitiator = false;
+
+                // Initialize ready flags
+                socket.isReadyForCall = false;
+                partner.isReadyForCall = false;
+
+                // Emit match found to both
+                socket.emit('match_found', { partnerId: partner.peerId, initiator: true });
+                partner.emit('match_found', { partnerId: socket.peerId, initiator: false });
 
                 console.log(`Matched ${socket.id} with ${partner.id}`);
             } else {
@@ -74,6 +89,26 @@ io.on('connection', (socket) => {
             socket.partner.emit('partner_disconnected');
             socket.partner.partner = null;
             socket.partner = null;
+        }
+        // Clear ready flag
+        socket.isReadyForCall = false;
+        socket.isInitiator = false;
+    });
+
+    // Client signals it's ready (has local stream and peer id registered)
+    socket.on('peer_ready', () => {
+        socket.isReadyForCall = true;
+        // If partner exists and is ready, coordinate start
+        if (socket.partner && socket.partner.isReadyForCall) {
+            // Decide who should start the call: the initiator
+            if (socket.isInitiator) {
+                socket.emit('start_call', { partnerId: socket.partner.peerId });
+            } else if (socket.partner.isInitiator) {
+                socket.partner.emit('start_call', { partnerId: socket.peerId });
+            } else {
+                // fallback: let this socket start
+                socket.emit('start_call', { partnerId: socket.partner.peerId });
+            }
         }
     });
 
