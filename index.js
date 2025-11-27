@@ -40,6 +40,7 @@ io.on('connection', (socket) => {
 
         // Store the peerId with the socket
         socket.peerId = peerId;
+        console.log(`Socket ${socket.id} registered peerId=${peerId}`);
 
         if (waitingUsers.length > 0) {
             const partner = waitingUsers.pop();
@@ -98,15 +99,20 @@ io.on('connection', (socket) => {
     // Client signals it's ready (has local stream and peer id registered)
     socket.on('peer_ready', () => {
         socket.isReadyForCall = true;
+        console.log(`Socket ${socket.id} isReadyForCall=true`);
         // If partner exists and is ready, coordinate start
         if (socket.partner && socket.partner.isReadyForCall) {
+            console.log(`Both peers ready: ${socket.id} <-> ${socket.partner.id}`);
             // Decide who should start the call: the initiator
             if (socket.isInitiator) {
+                console.log(`Instructing initiator ${socket.id} to start_call -> ${socket.partner.peerId}`);
                 socket.emit('start_call', { partnerId: socket.partner.peerId });
             } else if (socket.partner.isInitiator) {
+                console.log(`Instructing initiator ${socket.partner.id} to start_call -> ${socket.peerId}`);
                 socket.partner.emit('start_call', { partnerId: socket.peerId });
             } else {
                 // fallback: let this socket start
+                console.log(`Fallback start_call by ${socket.id} to ${socket.partner.peerId}`);
                 socket.emit('start_call', { partnerId: socket.partner.peerId });
             }
         }
