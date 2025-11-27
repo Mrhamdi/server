@@ -57,11 +57,31 @@ io.on('connection', (socket) => {
 
                 // Initialize ready flags
                 socket.isReadyForCall = false;
+                socket.isPreflightDone = false;
                 partner.isReadyForCall = false;
+                partner.isPreflightDone = false;
 
                 // Emit match found to both
                 socket.emit('match_found', { partnerId: partner.peerId, initiator: true });
                 partner.emit('match_found', { partnerId: socket.peerId, initiator: false });
+
+                // Emit preflight to allow clients to warm up signaling/data channels
+                socket.emit('preflight', { partnerId: partner.peerId });
+                partner.emit('preflight', { partnerId: socket.peerId });
+
+                // Force start after timeout even if preflight hasn't completed, to avoid stalling
+                setTimeout(() => {
+                    if (socket.partner && socket.partner.isReadyForCall && socket.isReadyForCall) {
+                        console.log('Preflight timeout reached — forcing start_call');
+                        if (socket.isInitiator) {
+                            socket.emit('start_call', { partnerId: socket.partner.peerId });
+                        } else if (socket.partner.isInitiator) {
+                            socket.partner.emit('start_call', { partnerId: socket.peerId });
+                        } else {
+                            socket.emit('start_call', { partnerId: socket.partner.peerId });
+                        }
+                    }
+                }, 3000);
 
                 console.log(`Matched ${socket.id} with ${partner.id}`);
             } else {
@@ -101,8 +121,9 @@ io.on('connection', (socket) => {
         socket.isReadyForCall = true;
         console.log(`Socket ${socket.id} isReadyForCall=true`);
         // If partner exists and is ready, coordinate start
-        if (socket.partner && socket.partner.isReadyForCall) {
-            console.log(`Both peers ready: ${socket.id} <-> ${socket.partner.id}`);
+        // start only when both peers are ready AND preflight completed
+        if (socket.partner && socket.partner.isReadyForCall && socket.isPreflightDone && socket.partner.isPreflightDone) {
+            console.log(`Both peers ready and preflight done: ${socket.id} <-> ${socket.partner.id}`);
             // Decide who should start the call: the initiator
             if (socket.isInitiator) {
                 console.log(`Instructing initiator ${socket.id} to start_call -> ${socket.partner.peerId}`);
@@ -113,6 +134,22 @@ io.on('connection', (socket) => {
             } else {
                 // fallback: let this socket start
                 console.log(`Fallback start_call by ${socket.id} to ${socket.partner.peerId}`);
+                socket.emit('start_call', { partnerId: socket.partner.peerId });
+            }
+        }
+    });
+
+    // Client reports preflight completed (used to warm-up connections)
+    socket.on('preflight_done', () => {
+        socket.isPreflightDone = true;
+        console.log(`Socket ${socket.id} preflight done`);
+        if (socket.partner && socket.partner.isReadyForCall && socket.isReadyForCall && socket.partner.isPreflightDone) {
+            console.log(`Both peers ready and preflight done (via preflight_done): ${socket.id} <-> ${socket.partner.id}`);
+            if (socket.isInitiator) {
+                socket.emit('start_call', { partnerId: socket.partner.peerId });
+            } else if (socket.partner.isInitiator) {
+                socket.partner.emit('start_call', { partnerId: socket.peerId });
+            } else {
                 socket.emit('start_call', { partnerId: socket.partner.peerId });
             }
         }
