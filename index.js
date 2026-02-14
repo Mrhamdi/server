@@ -26,6 +26,48 @@ app.use('/peerjs', peerServer);
 
 let waitingUsers = [];
 
+// Helper: clean full teardown of a partnership
+function teardownPartnership(socket) {
+    if (socket.partner) {
+        const partner = socket.partner;
+        partner.partner = null;
+        partner.isReadyForCall = false;
+        partner.isPreflightDone = false;
+        partner.isInitiator = false;
+        socket.partner = null;
+    }
+    socket.isReadyForCall = false;
+    socket.isPreflightDone = false;
+    socket.isInitiator = false;
+}
+
+// Helper: remove socket from waiting queue
+function removeFromQueue(socket) {
+    const index = waitingUsers.indexOf(socket);
+    if (index > -1) {
+        waitingUsers.splice(index, 1);
+    }
+}
+
+// Helper: emit start_call to the initiator of a pair
+function emitStartCall(socketA, socketB) {
+    // Guard: both must still be partnered with each other
+    if (!socketA.partner || !socketB.partner) return;
+    if (socketA.partner !== socketB || socketB.partner !== socketA) return;
+
+    if (socketA.isInitiator) {
+        console.log(`Instructing initiator ${socketA.id} to start_call -> ${socketB.peerId}`);
+        socketA.emit('start_call', { partnerId: socketB.peerId });
+    } else if (socketB.isInitiator) {
+        console.log(`Instructing initiator ${socketB.id} to start_call -> ${socketA.peerId}`);
+        socketB.emit('start_call', { partnerId: socketA.peerId });
+    } else {
+        // fallback
+        console.log(`Fallback start_call by ${socketA.id} to ${socketB.peerId}`);
+        socketA.emit('start_call', { partnerId: socketB.peerId });
+    }
+}
+
 io.on('connection', (socket) => {
     io.emit('user_count', io.engine.clientsCount);
     console.log(`User connected: ${socket.id}. Online: ${io.engine.clientsCount}`);
@@ -38,6 +80,15 @@ io.on('connection', (socket) => {
             return;
         }
 
+        // If already in a partnership, ignore (prevents double-queue)
+        if (socket.partner) {
+            console.warn(`Socket ${socket.id} already has a partner, ignoring find_partner`);
+            return;
+        }
+
+        // Remove from queue first to prevent duplicates
+        removeFromQueue(socket);
+
         // Store the peerId with the socket
         socket.peerId = peerId;
         console.log(`Socket ${socket.id} registered peerId=${peerId}`);
@@ -46,8 +97,8 @@ io.on('connection', (socket) => {
         let partner = null;
         while (waitingUsers.length > 0) {
             const candidate = waitingUsers.pop();
-            // Only accept connected sockets that have a valid peerId and aren't already paired
-            if (candidate.connected && candidate.peerId && !candidate.partner) {
+            // Only accept connected sockets with valid peerId, not already paired, and not self
+            if (candidate.connected && candidate.peerId && !candidate.partner && candidate.id !== socket.id) {
                 partner = candidate;
                 break;
             }
@@ -77,16 +128,19 @@ io.on('connection', (socket) => {
             partner.emit('preflight', { partnerId: socket.peerId });
 
             // Force start after timeout even if preflight hasn't completed, to avoid stalling
+            const matchTimestamp = Date.now();
+            socket._matchTimestamp = matchTimestamp;
+            partner._matchTimestamp = matchTimestamp;
+
             setTimeout(() => {
-                if (socket.partner && socket.partner.isReadyForCall && socket.isReadyForCall) {
+                // Only force-start if this match is still current
+                if (socket._matchTimestamp !== matchTimestamp) return;
+                if (!socket.partner || socket.partner !== partner) return;
+                if (!partner.partner || partner.partner !== socket) return;
+
+                if (socket.isReadyForCall && partner.isReadyForCall) {
                     console.log('Preflight timeout reached — forcing start_call');
-                    if (socket.isInitiator) {
-                        socket.emit('start_call', { partnerId: socket.partner.peerId });
-                    } else if (socket.partner.isInitiator) {
-                        socket.partner.emit('start_call', { partnerId: socket.peerId });
-                    } else {
-                        socket.emit('start_call', { partnerId: socket.partner.peerId });
-                    }
+                    emitStartCall(socket, partner);
                 }
             }, 3000);
 
@@ -105,42 +159,23 @@ io.on('connection', (socket) => {
         console.log(`User disconnected: ${socket.id}`);
 
         // Remove from waiting list
-        const index = waitingUsers.indexOf(socket);
-        if (index > -1) {
-            waitingUsers.splice(index, 1);
-        }
+        removeFromQueue(socket);
 
         // Notify partner if connected
         if (socket.partner) {
             socket.partner.emit('partner_disconnected');
-            socket.partner.partner = null;
-            socket.partner = null;
+            teardownPartnership(socket);
         }
-        // Clear ready flag
-        socket.isReadyForCall = false;
-        socket.isInitiator = false;
     });
 
     // Client signals it's ready (has local stream and peer id registered)
     socket.on('peer_ready', () => {
         socket.isReadyForCall = true;
         console.log(`Socket ${socket.id} isReadyForCall=true`);
-        // If partner exists and is ready, coordinate start
         // start only when both peers are ready AND preflight completed
         if (socket.partner && socket.partner.isReadyForCall && socket.isPreflightDone && socket.partner.isPreflightDone) {
             console.log(`Both peers ready and preflight done: ${socket.id} <-> ${socket.partner.id}`);
-            // Decide who should start the call: the initiator
-            if (socket.isInitiator) {
-                console.log(`Instructing initiator ${socket.id} to start_call -> ${socket.partner.peerId}`);
-                socket.emit('start_call', { partnerId: socket.partner.peerId });
-            } else if (socket.partner.isInitiator) {
-                console.log(`Instructing initiator ${socket.partner.id} to start_call -> ${socket.peerId}`);
-                socket.partner.emit('start_call', { partnerId: socket.peerId });
-            } else {
-                // fallback: let this socket start
-                console.log(`Fallback start_call by ${socket.id} to ${socket.partner.peerId}`);
-                socket.emit('start_call', { partnerId: socket.partner.peerId });
-            }
+            emitStartCall(socket, socket.partner);
         }
     });
 
@@ -150,13 +185,7 @@ io.on('connection', (socket) => {
         console.log(`Socket ${socket.id} preflight done`);
         if (socket.partner && socket.partner.isReadyForCall && socket.isReadyForCall && socket.partner.isPreflightDone) {
             console.log(`Both peers ready and preflight done (via preflight_done): ${socket.id} <-> ${socket.partner.id}`);
-            if (socket.isInitiator) {
-                socket.emit('start_call', { partnerId: socket.partner.peerId });
-            } else if (socket.partner.isInitiator) {
-                socket.partner.emit('start_call', { partnerId: socket.peerId });
-            } else {
-                socket.emit('start_call', { partnerId: socket.partner.peerId });
-            }
+            emitStartCall(socket, socket.partner);
         }
     });
 
@@ -169,9 +198,8 @@ io.on('connection', (socket) => {
     socket.on('disconnect_call', () => {
         if (socket.partner && socket.partner.connected) {
             socket.partner.emit('partner_disconnected');
-            socket.partner.partner = null;
         }
-        socket.partner = null;
+        teardownPartnership(socket);
     });
 });
 
