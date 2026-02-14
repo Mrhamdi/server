@@ -25,18 +25,6 @@ const peerServer = ExpressPeerServer(server, {
 app.use('/peerjs', peerServer);
 
 let waitingUsers = [];
-let hotlineWaiting = [];
-
-// Helper: check if two hotline users are compatible
-function isHotlineMatch(userA, userB) {
-    // userA wants to match with userB
-    if (userA.targetCountry && userA.targetCountry !== '' && userA.targetCountry !== userB.country) return false;
-    if (userA.excludeCountry && userA.excludeCountry !== '' && userA.excludeCountry === userB.country) return false;
-    // userB wants to match with userA
-    if (userB.targetCountry && userB.targetCountry !== '' && userB.targetCountry !== userA.country) return false;
-    if (userB.excludeCountry && userB.excludeCountry !== '' && userB.excludeCountry === userA.country) return false;
-    return true;
-}
 
 io.on('connection', (socket) => {
     io.emit('user_count', io.engine.clientsCount);
@@ -109,75 +97,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // HotLine: country-based matching
-    socket.on('find_hotline_partner', ({ peerId, country, targetCountry, excludeCountry }) => {
-        if (!peerId) {
-            console.warn(`Socket ${socket.id} sent empty peerId for hotline, ignoring`);
-            socket.emit('peer_not_ready');
-            return;
-        }
-
-        socket.peerId = peerId;
-        socket.country = country || 'Unknown';
-        socket.targetCountry = targetCountry || '';
-        socket.excludeCountry = excludeCountry || '';
-        console.log(`[HotLine] ${socket.id} peerId=${peerId} country=${socket.country} target=${targetCountry || 'Any'} exclude=${excludeCountry || 'None'}`);
-
-        // Find a compatible partner from the hotline queue
-        let partner = null;
-        let partnerIndex = -1;
-        for (let i = hotlineWaiting.length - 1; i >= 0; i--) {
-            const candidate = hotlineWaiting[i];
-            if (!candidate.connected || !candidate.peerId || candidate.partner) {
-                hotlineWaiting.splice(i, 1); // clean stale
-                continue;
-            }
-            if (isHotlineMatch(socket, candidate)) {
-                partner = candidate;
-                partnerIndex = i;
-                break;
-            }
-        }
-
-        if (partner) {
-            hotlineWaiting.splice(partnerIndex, 1);
-
-            socket.partner = partner;
-            partner.partner = socket;
-            socket.isInitiator = true;
-            partner.isInitiator = false;
-            socket.isReadyForCall = false;
-            socket.isPreflightDone = false;
-            partner.isReadyForCall = false;
-            partner.isPreflightDone = false;
-
-            // Include partner country in match_found
-            socket.emit('match_found', { partnerId: partner.peerId, initiator: true, partnerCountry: partner.country });
-            partner.emit('match_found', { partnerId: socket.peerId, initiator: false, partnerCountry: socket.country });
-
-            socket.emit('preflight', { partnerId: partner.peerId });
-            partner.emit('preflight', { partnerId: socket.peerId });
-
-            setTimeout(() => {
-                if (socket.partner && socket.partner.isReadyForCall && socket.isReadyForCall) {
-                    console.log('[HotLine] Preflight timeout — forcing start_call');
-                    if (socket.isInitiator) {
-                        socket.emit('start_call', { partnerId: socket.partner.peerId });
-                    } else if (socket.partner.isInitiator) {
-                        socket.partner.emit('start_call', { partnerId: socket.peerId });
-                    } else {
-                        socket.emit('start_call', { partnerId: socket.partner.peerId });
-                    }
-                }
-            }, 3000);
-
-            console.log(`[HotLine] Matched ${socket.id} (${socket.country}) with ${partner.id} (${partner.country})`);
-        } else {
-            hotlineWaiting.push(socket);
-            console.log(`[HotLine] ${socket.id} (${socket.country}) waiting for partner`);
-        }
-    });
-
     socket.on('disconnect', () => {
         // Use setTimeout so clientsCount reflects the removal
         setTimeout(() => {
@@ -185,14 +104,10 @@ io.on('connection', (socket) => {
         }, 0);
         console.log(`User disconnected: ${socket.id}`);
 
-        // Remove from waiting lists
+        // Remove from waiting list
         const index = waitingUsers.indexOf(socket);
         if (index > -1) {
             waitingUsers.splice(index, 1);
-        }
-        const hIndex = hotlineWaiting.indexOf(socket);
-        if (hIndex > -1) {
-            hotlineWaiting.splice(hIndex, 1);
         }
 
         // Notify partner if connected
