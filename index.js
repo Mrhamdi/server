@@ -1,0 +1,293 @@
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const { ExpressPeerServer } = require('peer');
+const cors = require('cors');
+
+const app = express();
+app.use(cors());
+
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    },
+    pingTimeout: 5000,
+    pingInterval: 10000
+});
+
+const peerServer = ExpressPeerServer(server, {
+    debug: true,
+    path: '/myapp'
+});
+
+app.use('/peerjs', peerServer);
+
+let waitingUsers = [];
+
+// Helper: clean full teardown of a partnership
+function teardownPartnership(socket) {
+    if (socket.partner) {
+        const partner = socket.partner;
+        partner.partner = null;
+        partner.isReadyForCall = false;
+        partner.isPreflightDone = false;
+        partner.isInitiator = false;
+        socket.partner = null;
+    }
+    socket.isReadyForCall = false;
+    socket.isPreflightDone = false;
+    socket.isInitiator = false;
+}
+
+// Helper: remove socket from waiting queue
+function removeFromQueue(socket) {
+    const index = waitingUsers.indexOf(socket);
+    if (index > -1) {
+        waitingUsers.splice(index, 1);
+    }
+}
+
+// Helper: emit start_call to the initiator of a pair
+function emitStartCall(socketA, socketB) {
+    // Guard: both must still be partnered with each other
+    if (!socketA.partner || !socketB.partner) return;
+    if (socketA.partner !== socketB || socketB.partner !== socketA) return;
+
+    if (socketA.isInitiator) {
+        console.log(`Instructing initiator ${socketA.id} to start_call -> ${socketB.peerId}`);
+        socketA.emit('start_call', { partnerId: socketB.peerId });
+    } else if (socketB.isInitiator) {
+        console.log(`Instructing initiator ${socketB.id} to start_call -> ${socketA.peerId}`);
+        socketB.emit('start_call', { partnerId: socketA.peerId });
+    } else {
+        // fallback
+        console.log(`Fallback start_call by ${socketA.id} to ${socketB.peerId}`);
+        socketA.emit('start_call', { partnerId: socketB.peerId });
+    }
+}
+
+io.on('connection', (socket) => {
+    io.emit('user_count', io.engine.clientsCount);
+    console.log(`User connected: ${socket.id}. Online: ${io.engine.clientsCount}`);
+
+    socket.on('find_partner', (data) => {
+        let peerId;
+        let targetCountry = ['Global'];
+        let blockedCountry = [];
+        let ownCountry = 'Unknown';
+        let userFlag = '';
+        let userGender = 'Unknown';
+        let targetGender = 'Anyone';
+
+        if (typeof data === 'string') {
+            peerId = data;
+        } else if (data && typeof data === 'object') {
+            peerId = data.peerId;
+            targetCountry = data.targetCountry || ['Global'];
+            blockedCountry = data.blockedCountry || [];
+            ownCountry = data.ownCountry || 'Unknown';
+            ownCountryCode = data.ownCountryCode || '';
+            userFlag = data.userFlag || '';
+            userGender = data.userGender || 'Unknown';
+            targetGender = data.targetGender || 'Anyone';
+        }
+
+        // Validate peerId before queuing
+        if (!peerId) {
+            console.warn(`Socket ${socket.id} sent empty peerId, ignoring`);
+            socket.emit('peer_not_ready');
+            return;
+        }
+
+        // If already in a partnership, ignore (prevents double-queue)
+        if (socket.partner) {
+            console.warn(`Socket ${socket.id} already has a partner, ignoring find_partner`);
+            return;
+        }
+
+        // Remove from queue first to prevent duplicates
+        removeFromQueue(socket);
+
+        // Store the peerId and country prefs with the socket
+        socket.peerId = peerId;
+        socket.targetCountry = targetCountry;
+        socket.blockedCountry = blockedCountry;
+        socket.ownCountry = ownCountry;
+        socket.ownCountryCode = ownCountryCode;
+        socket.userFlag = userFlag;
+        socket.userGender = userGender;
+        socket.targetGender = targetGender;
+        console.log(`Socket ${socket.id} registered peerId=${peerId}, prefer=${targetCountry}, block=${blockedCountry}, own=${ownCountry}, gender=${userGender}, looksFor=${targetGender}`);
+
+        // Find a valid partner from the waiting queue
+        let bestPartner = null;
+        let bestPartnerIndex = -1;
+        let bestScore = -1;
+
+        for (let i = waitingUsers.length - 1; i >= 0; i--) {
+            const candidate = waitingUsers[i];
+            
+            // Only accept connected sockets with valid peerId, not already paired, and not self
+            if (candidate.connected && candidate.peerId && !candidate.partner && candidate.id !== socket.id) {
+                const socketBlocksCandidate = (socket.blockedCountry && socket.blockedCountry.length > 0 && socket.blockedCountry.includes(candidate.ownCountry));
+                const candidateBlocksSocket = (candidate.blockedCountry && candidate.blockedCountry.length > 0 && candidate.blockedCountry.includes(socket.ownCountry));
+
+                const socketGenderMatches = (socket.targetGender === 'Anyone' || socket.targetGender === candidate.userGender);
+                const candidateGenderMatches = (candidate.targetGender === 'Anyone' || candidate.targetGender === socket.userGender);
+
+                // Absolute rules: Never match if blocked OR if gender doesn't match preferences
+                if (socketBlocksCandidate || candidateBlocksSocket || !socketGenderMatches || !candidateGenderMatches) {
+                    continue;
+                }
+
+                const socketPrefersCandidate = (!socket.targetCountry || socket.targetCountry.length === 0 || socket.targetCountry.includes('Global') || socket.targetCountry.includes(candidate.ownCountry));
+                const candidatePrefersSocket = (!candidate.targetCountry || candidate.targetCountry.length === 0 || candidate.targetCountry.includes('Global') || candidate.targetCountry.includes(socket.ownCountry));
+
+                // Calculate priority score (0: fallback, 1: one preferred, 2: mutually preferred)
+                let score = 0;
+                if (socketPrefersCandidate) score += 1;
+                if (candidatePrefersSocket) score += 1;
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestPartner = candidate;
+                    bestPartnerIndex = i;
+
+                    if (bestScore === 2) {
+                        break; // Perfect match found, stop searching
+                    }
+                }
+            }
+        }
+
+        let partner = bestPartner;
+        let partnerIndex = bestPartnerIndex;
+
+        if (partner) {
+            // Remove candidate from waiting list directly using its index
+            waitingUsers.splice(partnerIndex, 1);
+
+            // Store partner info
+            socket.partner = partner;
+            partner.partner = socket;
+
+            // Mark initiator flags
+            socket.isInitiator = true;
+            partner.isInitiator = false;
+
+            // Initialize ready flags
+            socket.isReadyForCall = false;
+            socket.isPreflightDone = false;
+            partner.isReadyForCall = false;
+            partner.isPreflightDone = false;
+
+            // Emit match found to both, including partner's info
+            socket.emit('match_found', { 
+                partnerId: partner.peerId, 
+                partnerCountry: partner.ownCountry, 
+                partnerCountryCode: partner.ownCountryCode,
+                partnerFlag: partner.userFlag, 
+                partnerGender: partner.userGender,
+                initiator: true 
+            });
+            partner.emit('match_found', { 
+                partnerId: socket.peerId, 
+                partnerCountry: socket.ownCountry, 
+                partnerCountryCode: socket.ownCountryCode,
+                partnerFlag: socket.userFlag, 
+                partnerGender: socket.userGender,
+                initiator: false 
+            });
+
+            // Emit preflight to allow clients to warm up signaling/data channels
+            socket.emit('preflight', { partnerId: partner.peerId });
+            partner.emit('preflight', { partnerId: socket.peerId });
+
+            // Force start after timeout even if preflight hasn't completed, to avoid stalling
+            const matchTimestamp = Date.now();
+            socket._matchTimestamp = matchTimestamp;
+            partner._matchTimestamp = matchTimestamp;
+
+            setTimeout(() => {
+                // Only force-start if this match is still current
+                if (socket._matchTimestamp !== matchTimestamp) return;
+                if (!socket.partner || socket.partner !== partner) return;
+                if (!partner.partner || partner.partner !== socket) return;
+
+                if (socket.isReadyForCall && partner.isReadyForCall) {
+                    console.log('Preflight timeout reached — forcing start_call');
+                    emitStartCall(socket, partner);
+                }
+            }, 3000);
+
+            console.log(`Matched ${socket.id} with ${partner.id}`);
+        } else {
+            waitingUsers.push(socket);
+            console.log(`User ${socket.id} waiting for partner`);
+        }
+    });
+
+    socket.on('disconnect', () => {
+        // Use setTimeout so clientsCount reflects the removal
+        setTimeout(() => {
+            io.emit('user_count', io.engine.clientsCount);
+        }, 0);
+        console.log(`User disconnected: ${socket.id}`);
+
+        // Remove from waiting list
+        removeFromQueue(socket);
+
+        // Notify partner if connected
+        if (socket.partner) {
+            socket.partner.emit('partner_disconnected');
+            teardownPartnership(socket);
+        }
+    });
+
+    // Client signals it's ready (has local stream and peer id registered)
+    socket.on('peer_ready', () => {
+        socket.isReadyForCall = true;
+        console.log(`Socket ${socket.id} isReadyForCall=true`);
+        // start only when both peers are ready AND preflight completed
+        if (socket.partner && socket.partner.isReadyForCall && socket.isPreflightDone && socket.partner.isPreflightDone) {
+            console.log(`Both peers ready and preflight done: ${socket.id} <-> ${socket.partner.id}`);
+            emitStartCall(socket, socket.partner);
+        }
+    });
+
+    // Client reports preflight completed (used to warm-up connections)
+    socket.on('preflight_done', () => {
+        socket.isPreflightDone = true;
+        console.log(`Socket ${socket.id} preflight done`);
+        if (socket.partner && socket.partner.isReadyForCall && socket.isReadyForCall && socket.partner.isPreflightDone) {
+            console.log(`Both peers ready and preflight done (via preflight_done): ${socket.id} <-> ${socket.partner.id}`);
+            emitStartCall(socket, socket.partner);
+        }
+    });
+
+    socket.on('send_message', (message) => {
+        if (socket.partner && socket.partner.connected) {
+            socket.partner.emit('receive_message', message);
+        }
+    });
+
+    socket.on('disconnect_call', () => {
+        if (socket.partner && socket.partner.connected) {
+            socket.partner.emit('partner_disconnected');
+        }
+        teardownPartnership(socket);
+    });
+
+    socket.on('mute_status', (isMuted) => {
+        if (socket.partner && socket.partner.connected) {
+            socket.partner.emit('partner_mute_status', isMuted);
+        }
+    });
+});
+
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
