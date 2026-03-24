@@ -5,17 +5,22 @@ const { ExpressPeerServer } = require('peer');
 const cors = require('cors');
 
 const app = express();
-const corsOptions = {
-    origin: ["http://localhost:5173", "https://my-ghost-blond.vercel.app", "*"],
-    methods: ["GET", "POST"],
+app.use(cors({
+    origin: (origin, callback) => {
+        // Allow all origins for this public application
+        callback(null, true);
+    },
     credentials: true
-};
-app.use(cors(corsOptions));
+}));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: corsOptions,
-    transports: ['websocket', 'polling'],
+    cors: {
+        origin: true, // Allow all origins
+        methods: ["GET", "POST"],
+        credentials: true
+    },
+    transports: ['polling', 'websocket'], // Allow both, but let it decide
     pingTimeout: 5000,
     pingInterval: 10000
 });
