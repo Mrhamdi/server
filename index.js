@@ -23,11 +23,12 @@ const io = new Server(server, {
 // Proxy for Geolocation to bypass CORS on frontend
 app.get('/api/geo', async (req, res) => {
     try {
-        const fetch = (await import('node-fetch')).default;
+        // Use global fetch (available in Node 18+)
         const response = await fetch('https://ipwho.is/');
         const data = await response.json();
         res.json(data);
     } catch (err) {
+        console.error("Geo proxy failed:", err);
         res.status(500).json({ error: 'Failed to fetch geo data' });
     }
 });
