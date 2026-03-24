@@ -5,16 +5,31 @@ const { ExpressPeerServer } = require('peer');
 const cors = require('cors');
 
 const app = express();
-app.use(cors());
+const corsOptions = {
+    origin: ["http://localhost:5173", "https://my-ghost-blond.vercel.app", "*"],
+    methods: ["GET", "POST"],
+    credentials: true
+};
+app.use(cors(corsOptions));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    },
+    cors: corsOptions,
+    transports: ['websocket', 'polling'],
     pingTimeout: 5000,
     pingInterval: 10000
+});
+
+// Proxy for Geolocation to bypass CORS on frontend
+app.get('/api/geo', async (req, res) => {
+    try {
+        const fetch = (await import('node-fetch')).default;
+        const response = await fetch('https://ipwho.is/');
+        const data = await response.json();
+        res.json(data);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch geo data' });
+    }
 });
 
 const peerServer = ExpressPeerServer(server, {
