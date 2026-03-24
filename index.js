@@ -28,8 +28,13 @@ const io = new Server(server, {
 // Proxy for Geolocation to bypass CORS on frontend
 app.get('/api/geo', async (req, res) => {
     try {
-        // Use global fetch (available in Node 18+)
-        const response = await fetch('https://ipwho.is/');
+        // Correct way to get client IP on Render/Vercel (it's often a comma-separated list)
+        // We take the first IP in the list
+        const xForwardedFor = req.headers['x-forwarded-for'];
+        const clientIp = xForwardedFor ? xForwardedFor.split(',')[0].trim() : req.socket.remoteAddress;
+        
+        // Use ipwho.is with the specific client IP
+        const response = await fetch(`https://ipwho.is/${clientIp}`);
         const data = await response.json();
         res.json(data);
     } catch (err) {
